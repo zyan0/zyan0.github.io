@@ -210,50 +210,324 @@ if __name__ == "__main__":
 
 # 3. Translating Japanese SRT to Chinese With `translate_srt_jp_to_cn.py`
 
-Finally, you can run a **chunk-based** translation on the generated SRT. Below is a script that handles the main translation process, leveraging GPT-4 for high-quality output.
+Finally, you can run a chunk-based translation on the generated SRT. This process involves dividing the subtitle text into manageable segments and translating them efficiently using GPT-4. Below is a detailed script that demonstrates:
+
+* Async Summarization: For context-aware translation, the script first summarizes the entire subtitle text.
+* Chunk-based Translation: Subtitles are processed in smaller, manageable blocks, leveraging GPT-4’s capacity for parallel translation.
+* User Interaction: Users can review and edit the generated summaries for accuracy and contextual relevance.
+* Bilingual Output: The final result includes both the original and translated text for reference, ensuring a comprehensive subtitle file.
 
 ```python
 #!/usr/bin/env python3
 
+import asyncio
 import openai
 import argparse
 import os
+from tqdm import tqdm
 
-def translate_srt(input_srt, output_srt, model="gpt-4", language_pair=("ja", "zh")):
-    """
-    Translates the input SRT file from Japanese to Chinese.
-    """
-    with open(input_srt, "r", encoding="utf-8") as f:
-        srt_text = f.read()
+###############################################################################
+#                              ASYNC SUMMARIZATION
+###############################################################################
 
-    response = openai.ChatCompletion.create(
-        model=model,
+async def async_summarize_srt(srt_text: str) -> str:
+    """
+    Asynchronously summarizes the given SRT text using GPT-4o-2024-11-20.
+    Return the summarized text as a string.
+    """
+    response = openai.chat.completions.create(
+        model="gpt-4o-2024-11-20",
         messages=[
-            {"role": "system", "content": "Translate subtitles from Japanese to Chinese."},
-            {"role": "user", "content": srt_text}
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant that summarizes a movie or show's subtitle text "
+                    "into a concise description of the overall context, plot, and key topics."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Please summarize the following subtitle text. Include essential plot points, "
+                    "characters, and overall style or tone. Keep it concise:\n\n"
+                    f"{srt_text}"
+                ),
+            },
+        ],
+        temperature=0.5,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def async_summarize_two_parts(srt_full_text: str) -> str:
+    """
+    Split the SRT text into two halves, do a two-step summarization:
+      1) Summarize Part 1 -> summary1
+      2) Combine (summary1 + Part 2) -> final_summary
+    """
+    # Naive split by character length
+    half = len(srt_full_text) // 2
+    part1 = srt_full_text[:half]
+    part2 = srt_full_text[half:]
+
+    # 1) Summarize first half
+    print("Summarizing Part 1 (first half of text)...")
+    summary1 = await async_summarize_srt(part1)
+    print("--- Summary of Part 1 ---")
+    print(summary1)
+    print("-------------------------\n")
+
+    # 2) Summarize (summary1 + Part 2)
+    print("Summarizing (Summary1 + Part 2) to get the final summary...")
+    combined_text = summary1 + "\n\n" + part2
+    final_summary = await async_summarize_srt(combined_text)
+    return final_summary
+
+
+###############################################################################
+#                           ASYNC TRANSLATION UTILS
+###############################################################################
+
+async def async_translate_batch(
+    block_texts: list[str], 
+    summary_context: str
+) -> list[str]:
+    """
+    Asynchronously translates a batch of Japanese subtitle blocks into Chinese 
+    using GPT-4o-2024-11-20, with summary_context as background knowledge.
+
+    Returns a list of translations, one for each text in block_texts.
+    """
+    delimiter = "|||"
+    joined_text = f"\n{delimiter}\n".join(block_texts)
+
+    user_prompt = (
+        "You have the following background/context for the entire show:\n\n"
+        f"{summary_context}\n\n"
+        "Now, translate the following Japanese subtitle blocks into Chinese. "
+        f"Each block is separated by the delimiter '{delimiter}'. "
+        "Output them in the same order, separated by that same delimiter, and do not add extra commentary.\n\n"
+        f"{joined_text}"
+    )
+
+    response = openai.chat.completions.create(
+        model="gpt-4o-2024-11-20",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant that accurately translates "
+                    "Japanese text into Chinese, considering the background context. "
+                    "Preserve meaning, style, and tone."
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
         ],
         temperature=0.2,
     )
 
-    translated_srt = response.choices[0].message.content
+    full_translation = response.choices[0].message.content.strip()
+    translated_blocks = [t.strip() for t in full_translation.split(delimiter)]
+    return translated_blocks
 
-    with open(output_srt, "w", encoding="utf-8") as f:
-        f.write(translated_srt)
-    print(f"Translated SRT saved to {output_srt}")
+
+async def async_process_chunk(
+    chunk_index: int,
+    block_indices: list[int],
+    block_texts: list[str],
+    summary_context: str,
+    results_container: dict[int, str],
+) -> None:
+    """
+    Translates the batch of `block_texts` (all from a single chunk) asynchronously.
+    Stores each translation in `results_container[index] = translation_text`.
+    """
+    translations = await async_translate_batch(block_texts, summary_context)
+    for i, trans in zip(block_indices, translations):
+        results_container[i] = trans
+
+
+###############################################################################
+#                         MAIN TRANSLATION LOGIC
+###############################################################################
+
+async def process_srt_with_summary_and_async(
+    input_file: str,
+    output_file: str,
+    chunk_size: int = 5,
+    sample_interval: int = 10
+):
+    """
+    1. Two-step Summarize the entire SRT text for context (async).
+    2. Prompt user to confirm or edit that final summary.
+    3. Translate SRT blocks in chunks (in parallel) using async, with the final summary as context.
+    4. Save bilingual SRT.
+    """
+
+    # ------------------- Read entire SRT and parse blocks ---------------------
+    with open(input_file, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    srt_full_text = "\n".join(lines)
+
+    blocks = []
+    current_block = []
+    for line in lines:
+        if line.strip() == "":
+            if current_block:
+                blocks.append(current_block)
+                current_block = []
+        else:
+            current_block.append(line)
+    if current_block:
+        blocks.append(current_block)
+
+    # ------------------- Two-part Summarization (Async) -----------------------
+    print("Performing two-part summarization of the entire SRT for context...")
+    final_summary = await async_summarize_two_parts(srt_full_text)
+    print("\n------ PROPOSED FINAL SUMMARY ------")
+    print(final_summary)
+    print("------ END SUMMARY ------\n")
+
+    # Prompt user for confirmation or edits
+    confirm = input("Do you want to use this final summary as is? (y/n) ")
+    if confirm.lower().strip() != "y":
+        print("Please type in the corrected/edited summary (or press Enter to keep it as is):")
+        user_edited = input("> ").strip()
+        if user_edited:
+            final_summary = user_edited
+
+    # ------------------- Prepare block placeholders & gather JP text ----------
+    new_srt_blocks = []
+    block_texts_jp = []
+    for block in blocks:
+        if len(block) < 3:
+            # Malformed or no text
+            new_srt_blocks.append(block)
+            block_texts_jp.append("")
+            continue
+
+        index_line = block[0]
+        time_line = block[1]
+        subtitle_text_lines = block[2:]
+        subtitle_jp = "\n".join(subtitle_text_lines)
+
+        new_srt_blocks.append([index_line, time_line, subtitle_jp, None])
+        block_texts_jp.append(subtitle_jp)
+
+    print("\nTranslating with background context...\n")
+    total_blocks = len(block_texts_jp)
+    print(f"Total blocks to translate: {total_blocks}")
+
+    # ------------------- Build async tasks for chunk parallelization ----------
+    tasks = []
+    results_container = {}  # {block_index: "translated text"}
+
+    block_ranges = range(0, total_blocks, chunk_size)
+    for start in block_ranges:
+        end = start + chunk_size
+        chunk = block_texts_jp[start:end]
+
+        # Indices of non-empty blocks in this chunk
+        chunk_indices = [i for i, txt in enumerate(chunk, start=start) if txt.strip() != ""]
+        actual_texts = [block_texts_jp[i] for i in chunk_indices]
+
+        if not actual_texts:
+            continue
+
+        # Create an async task for each chunk
+        task = asyncio.create_task(
+            async_process_chunk(
+                chunk_index=start // chunk_size,
+                block_indices=chunk_indices,
+                block_texts=actual_texts,
+                summary_context=final_summary,
+                results_container=results_container
+            )
+        )
+        tasks.append(task)
+
+    # Run all chunk translations concurrently, with a progress bar
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Translating chunks"):
+        await f
+
+    # Show sample translations (by chunk) for user to see progress
+    chunk_count = (total_blocks + chunk_size - 1) // chunk_size
+    for c in range(chunk_count):
+        if (c+1) % sample_interval == 0:
+            start = c * chunk_size
+            end = start + chunk_size
+            chunk_indices = [i for i in range(start, min(end, total_blocks)) if block_texts_jp[i].strip() != ""]
+            if not chunk_indices:
+                continue
+            sample_ix = chunk_indices[-1]
+            if sample_ix in results_container:
+                jp_text = block_texts_jp[sample_ix]
+                cn_text = results_container[sample_ix]
+                print("\n--- Translation Sample ---")
+                print(f"Block {sample_ix+1} Japanese:\n{jp_text}")
+                print(f"Block {sample_ix+1} Chinese:\n{cn_text}")
+                print("--- End Sample ---\n")
+
+    # ------------------- Write out bilingual SRT ------------------------------
+    with open(output_file, "w", encoding="utf-8") as out:
+        for i, block in enumerate(new_srt_blocks):
+            if len(block) == 4:
+                jp_text = block[2]
+                cn_text = results_container.get(i)
+                if cn_text:
+                    out.write(block[0] + "\n")  # index
+                    out.write(block[1] + "\n")  # time
+                    # out.write(jp_text + "\n")  # original JP
+                    out.write(cn_text + "\n")  # translated CN
+                    out.write("\n")
+                else:
+                    for line in block[:3]:
+                        out.write(line + "\n")
+                    out.write("\n")
+            else:
+                for line in block:
+                    out.write(line + "\n")
+                out.write("\n")
+
+    print(f"\nTranslation complete. Output saved to '{output_file}'.")
+
+
+###############################################################################
+#                                  ENTRY POINT
+###############################################################################
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Translate a Japanese SRT file to Chinese using GPT-4."
+        description=(
+            "Translate an SRT file from Japanese to Chinese using GPT-4o-2024-11-20 with:\n"
+            "1) Two-part summarization for context.\n"
+            "2) Async parallel chunked translation.\n"
+            "3) Bilingual output.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--input_srt", required=True, help="Path to the input SRT file (Japanese).")
-    parser.add_argument("--output_srt", required=True, help="Path to save the output SRT file (Chinese).")
+    parser.add_argument("--input", required=True, help="Path to the input Japanese SRT file")
+    parser.add_argument("--output", required=True, help="Path to save the output bilingual SRT file")
+    parser.add_argument("--chunk_size", type=int, default=5, help="Number of blocks to translate per chunk")
+    parser.add_argument("--sample_interval", type=int, default=10, help="Print a sample translation every N chunks")
+
     args = parser.parse_args()
 
     openai.api_key = os.environ.get("OPENAI_API_KEY")
     if not openai.api_key:
         raise ValueError("No OPENAI_API_KEY found in environment variables.")
 
-    translate_srt(args.input_srt, args.output_srt)
+    asyncio.run(
+        process_srt_with_summary_and_async(
+            input_file=args.input,
+            output_file=args.output,
+            chunk_size=args.chunk_size,
+            sample_interval=args.sample_interval,
+        )
+    )
 
 if __name__ == "__main__":
     main()
@@ -294,7 +568,7 @@ This command produces a new video file (`output_video.mp4`) with embedded subtit
 
 ---
 
-## Putting it all together
+## Putting It All Together
 
 Let's put it all together and run the following command:
 
